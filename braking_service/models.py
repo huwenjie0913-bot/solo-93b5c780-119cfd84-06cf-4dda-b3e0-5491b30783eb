@@ -101,6 +101,27 @@ class AdhesionSegment(BaseModel):
         return self
 
 
+class BrakeGroup(BaseModel):
+    """车辆组：长编组列车按前后顺序分组描述制动指令传播与建立。
+
+    制动指令沿列车由前向后传播，因此各组 delay_s 应单调不减；
+    各组质量合计必须等于 vehicle.mass_t。每组独立提交制动力曲线，
+    数值积分按各组实际生效时刻汇总全列制动力，各组分别受
+    mu(s) * m_group * g 的黏着上限约束。
+    """
+
+    name: str = Field(..., min_length=1, max_length=64,
+                      description="组名（在输出中唯一标识该组）")
+    mass_t: float = Field(..., gt=0, le=30000, description="该组质量 (t)")
+    delay_s: float = Field(
+        ..., ge=0, le=60,
+        description="制动指令传播至该组的延迟 (s)；沿列车由前向后应单调不减")
+    buildup_s: float = Field(
+        0.0, ge=0, le=60, description="该组制动力线性建立时间 (s)")
+    service_brake: BrakeCurve = Field(..., description="该组常用制动力曲线")
+    emergency_brake: BrakeCurve = Field(..., description="该组紧急制动力曲线")
+
+
 class Scenario(BaseModel):
     """工况：覆盖基准参数以模拟干轨/湿轨/部分制动失效等。"""
 
@@ -120,7 +141,11 @@ class Scenario(BaseModel):
         1.0, gt=0, le=1.0, description="制动力比例系数，1=全力，<1 表示部分失效"
     )
     delay_s: Optional[float] = Field(
-        None, ge=0, le=60, description="制动延迟覆盖 (s)；缺省用请求级 brake_delay_s"
+        None, ge=0, le=60,
+        description=(
+            "制动延迟覆盖 (s)；缺省用请求级 brake_delay_s。"
+            "提交 brake_groups 时，该值作为附加的统一指令延迟叠加到各组传播延迟上"
+        ),
     )
     is_baseline: bool = Field(False, description="是否作为对比基准工况")
 
@@ -141,6 +166,15 @@ class SimulationRequest(BaseModel):
 
     brake_delay_s: float = Field(..., ge=0, le=60, description="制动指令到开始建立的延迟 (s)")
     brake_buildup_s: float = Field(0.0, ge=0, le=60, description="制动力线性建立时间 (s)")
+
+    brake_groups: Optional[list[BrakeGroup]] = Field(
+        None, min_length=1,
+        description=(
+            "车辆组（按列车前后顺序）：分组制动传播模型。提交后数值积分按各组"
+            "实际生效时刻汇总制动力，并以现有统一延迟模型为基线输出对比；"
+            "缺省或为空时保持统一延迟模型行为，与旧请求兼容"
+        ),
+    )
 
     adhesion: float = Field(..., gt=0, le=1.0, description="基准黏着系数")
     rolling_resistance: RollingResistance = Field(default_factory=RollingResistance)

@@ -5,6 +5,8 @@
     ds/dt = v
 其中：
 - F_brake 受黏着限制：F <= mu(s) * m * g，mu(s) 可沿里程分段变化；
+  提交车辆组时 F_brake 为各组按自身生效时刻出力的总和，
+  每组分别受 mu(s) * m_group * g 约束；
 - F_rr 为 Davis 滚动阻力；
 - F_grade = m * g * slope(s)，坡度分段恒定，上坡为正。
 """
@@ -37,11 +39,43 @@ def interp(x: float, xs: list[float], ys: list[float]) -> float:
 
 
 @dataclass
+class BrakeGroupSpec:
+    """车辆组的内部表示（内部单位制）。
+
+    delay_s 为含工况级附加延迟后的生效延迟；制动力按该组曲线插值，
+    受本组黏着上限 mu(s) * mass_kg * g 约束。
+    """
+
+    name: str
+    mass_kg: float
+    curve_speeds: list[float]  # m/s，单调递增
+    curve_forces: list[float]  # N
+    delay_s: float             # 指令传播至该组的生效延迟 (s)
+    buildup_s: float           # 该组制动力线性建立时间 (s)
+
+    def force(self, v: float, t: float, mu: float,
+              force_factor: float) -> float:
+        """该组在 (v, t) 处的实际制动力（含建立斜坡与本组黏着上限）。"""
+        if t < self.delay_s:
+            return 0.0
+        if self.buildup_s > 0:
+            scale = min(1.0, (t - self.delay_s) / self.buildup_s)
+        else:
+            scale = 1.0
+        f = interp(max(v, 0.0), self.curve_speeds, self.curve_forces)
+        f *= force_factor * scale
+        cap = mu * self.mass_kg * GRAVITY
+        return min(f, cap)
+
+
+@dataclass
 class ForceModel:
     """单个工况 + 制动模式下的合力模型。
 
     黏着系数可沿里程分段（adhesion_starts/values 为 [start, end) 分段表）；
     adhesion_base 为区段外的标量值，也作为与标量基线对比时的基准。
+    groups 非空时启用分组制动传播：各组按自身延迟/建立时间出力，
+    统一延迟字段仅用于等效延迟折算的回落与输出展示。
     """
 
     mass_kg: float           # 静态质量
@@ -59,6 +93,7 @@ class ForceModel:
     adhesion_starts: list[float] = field(default_factory=list)
     adhesion_ends: list[float] = field(default_factory=list)
     adhesion_values: list[float] = field(default_factory=list)
+    groups: Optional[list[BrakeGroupSpec]] = None  # 分组制动传播；None=统一延迟模型
 
     @property
     def adhesion(self) -> float:
@@ -75,6 +110,8 @@ class ForceModel:
         return self.adhesion_base
 
     def brake_force(self, v: float, t: float, s: float) -> float:
+        if self.groups is not None:
+            return self.brake_force_breakdown(v, t, s)[0]
         if t < self.delay_s:
             return 0.0
         if self.buildup_s > 0:
@@ -85,6 +122,36 @@ class ForceModel:
         f *= self.force_factor * scale
         cap = self.adhesion_at(s) * self.mass_kg * GRAVITY  # 黏着上限
         return min(f, cap)
+
+    def brake_force_breakdown(self, v: float, t: float, s: float
+                              ) -> tuple[float, list[float]]:
+        """分组模型：返回 (全列总制动力, 各组制动力列表)。
+
+        各组按自身生效时刻（delay_s + buildup_s 斜坡）出力，并分别受
+        本组黏着上限 mu(s) * m_group * g 约束；总和即全列制动力。
+        """
+        assert self.groups is not None
+        mu = self.adhesion_at(s)
+        per = [g.force(v, t, mu, self.force_factor) for g in self.groups]
+        return sum(per), per
+
+    def equivalent_delay_s(self, v: float) -> float:
+        """空走距离折算用的等效制动延迟 (s)。
+
+        统一模型：delay + buildup/2（建立期按平均半力折算）。
+        分组模型：各组 (delay_g + buildup_g/2) 按该组全力制动力份额加权，
+        使 v * t_eq 近似等于力建立过程中的空走距离。
+        """
+        if not self.groups:
+            return self.delay_s + self.buildup_s / 2.0
+        weights = [interp(max(v, 0.0), g.curve_speeds, g.curve_forces)
+                   for g in self.groups]
+        total = sum(weights)
+        if total <= 0:  # 曲线全零时退化为质量加权
+            weights = [g.mass_kg for g in self.groups]
+            total = sum(weights)
+        return (sum(w * (g.delay_s + g.buildup_s / 2.0)
+                    for w, g in zip(weights, self.groups)) / total)
 
     def accel(self, t: float, s: float, v: float) -> float:
         vv = max(v, 0.0)

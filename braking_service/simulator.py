@@ -1,4 +1,8 @@
-"""仿真编排：把请求转换为内部单位制，逐工况 × 制动模式积分并汇总结果。"""
+"""仿真编排：把请求转换为内部单位制，逐工况 × 制动模式积分并汇总结果。
+
+提交 brake_groups 时启用分组制动传播：各车辆组按自身延迟/建立时间出力，
+并以现有统一延迟模型为基线输出停车距离、最晚制动位置与停车余量对比。
+"""
 
 from __future__ import annotations
 
@@ -8,8 +12,9 @@ from dataclasses import replace
 from typing import Optional
 
 from .models import SimulationRequest
-from .physics import (GRAVITY, ForceModel, Trajectory, backward_brake_position,
-                      downsample, integrate, scan_violations)
+from .physics import (GRAVITY, BrakeGroupSpec, ForceModel, Trajectory,
+                      backward_brake_position, downsample, integrate,
+                      scan_violations)
 
 MODES = ("service", "emergency")
 
@@ -72,6 +77,30 @@ def _make_force_model(req: SimulationRequest, track: Track, scenario,
         adhesion_ends=[s.end_m for s in segs],
         adhesion_values=[s.adhesion for s in segs],
     )
+
+
+def _make_grouped_force_model(req: SimulationRequest, track: Track, scenario,
+                              curve_attr: str) -> ForceModel:
+    """分组制动传播模型：各组按自身曲线/延迟/建立时间出力。
+
+    工况级 delay_s（若提交）作为附加的统一指令延迟叠加到各组传播延迟上；
+    顶层统一曲线/延迟字段保留在模型中，仅用于展示与等效延迟回落。
+    """
+    base = _make_force_model(req, track, scenario, getattr(req, curve_attr))
+    offset = scenario.delay_s if scenario.delay_s is not None else 0.0
+    vscale = 1.0 / 3.6 if req.speed_unit == "km/h" else 1.0
+    groups: list[BrakeGroupSpec] = []
+    for g in req.brake_groups or []:
+        curve = getattr(g, curve_attr)
+        groups.append(BrakeGroupSpec(
+            name=g.name,
+            mass_kg=g.mass_t * 1000.0,
+            curve_speeds=[p.speed * vscale for p in curve.points],
+            curve_forces=[p.force_kn * 1000.0 for p in curve.points],
+            delay_s=g.delay_s + offset,
+            buildup_s=g.buildup_s,
+        ))
+    return replace(base, groups=groups)
 
 
 def _low_mu_zones(model: ForceModel) -> list[dict]:
@@ -165,6 +194,74 @@ def _low_adhesion_summary(model: ForceModel, traj: Trajectory,
     }
 
 
+def _group_milestones(model: ForceModel, traj: Trajectory) -> list[dict]:
+    """各组开始响应/达到全力的时刻与里程（里程按轨迹 t→s 线性插值）。
+
+    里程按常用制动轨迹计算；若列车停车或积分终止早于某时刻，对应里程为 None。
+    """
+    ts = [p["t_s"] for p in traj.points]
+    ss = [p["s_m"] for p in traj.points]
+
+    def pos_at(t: float) -> Optional[float]:
+        if not ts or t < ts[0] or t > ts[-1]:
+            return None
+        i = bisect_right(ts, t) - 1
+        if i >= len(ts) - 1:
+            return ss[-1]
+        t0, t1 = ts[i], ts[i + 1]
+        if t1 <= t0:
+            return ss[i]
+        frac = (t - t0) / (t1 - t0)
+        return ss[i] + frac * (ss[i + 1] - ss[i])
+
+    t_fulls = [g.delay_s + g.buildup_s for g in model.groups or []]
+    t_last = max(t_fulls)
+    # 并列时取更靠后的车辆组（尾部建立最晚是主要关切）
+    last_idx = max(i for i, tf in enumerate(t_fulls) if tf >= t_last - 1e-9)
+
+    out: list[dict] = []
+    for i, g in enumerate(model.groups or []):
+        t_resp = g.delay_s
+        t_full = t_fulls[i]
+        s_resp = pos_at(t_resp)
+        s_full = pos_at(t_full)
+        entry: dict = {
+            "name": g.name,
+            "mass_t": round(g.mass_kg / 1000.0, 3),
+            "delay_s": round(g.delay_s, 3),
+            "buildup_s": round(g.buildup_s, 3),
+            "response_time_s": round(t_resp, 3),
+            "response_position_m": (round(s_resp, 2)
+                                    if s_resp is not None else None),
+            "full_time_s": round(t_full, 3),
+            "full_position_m": (round(s_full, 2)
+                                if s_full is not None else None),
+            "is_last_to_full": i == last_idx,
+        }
+        if s_resp is None or s_full is None:
+            entry["note"] = "列车停车或积分终止早于该时刻，对应里程不可得"
+        out.append(entry)
+    return out
+
+
+def _brake_force_series(model: ForceModel, traj_out: list[dict]) -> list[dict]:
+    """全列制动力—时间序列（含各组分解），与输出轨迹点对齐。"""
+    names = [g.name for g in model.groups or []]
+    series: list[dict] = []
+    for p in traj_out:
+        total, per = model.brake_force_breakdown(
+            p["v_mps"], p["t_s"], p["s_m"])
+        series.append({
+            "t_s": p["t_s"],
+            "s_m": p["s_m"],
+            "v_kmh": p["v_kmh"],
+            "total_force_kn": round(total / 1000.0, 2),
+            "group_forces_kn": {n: round(f / 1000.0, 2)
+                                for n, f in zip(names, per)},
+        })
+    return series
+
+
 def _limit_points(req: SimulationRequest, track: Track, model: ForceModel,
                   traj: Trajectory, v0_mps: float, zones: list[dict]
                   ) -> list[dict]:
@@ -203,7 +300,7 @@ def _limit_points(req: SimulationRequest, track: Track, model: ForceModel,
         s_full_base, _, _ = backward_brake_position(
             scalar_model, seg.start_m, lim_mps, v_app, bw_min)
 
-        delay_dist = v_app * (model.delay_s + model.buildup_s / 2.0)
+        delay_dist = v_app * model.equivalent_delay_s(v_app)
         latest = None
         latest_base = None
         feasible = False
@@ -319,7 +416,7 @@ def _mode_result(req: SimulationRequest, track: Track, model: ForceModel,
         p["v_mps"] = round(p["v_mps"], 4)
         p["a_mps2"] = round(p["a_mps2"], 4)
 
-    return {
+    out = {
         "mode": curve_name,
         "status": traj.status,
         "termination": None if traj.status == "ok" else {
@@ -339,6 +436,91 @@ def _mode_result(req: SimulationRequest, track: Track, model: ForceModel,
         "violations": violations,
         "trajectory": traj_out,
     }
+    if model.groups:
+        # 分组制动传播：里程碑（由编排层提升到工况级）与全列制动力—时间序列
+        out["group_milestones"] = _group_milestones(model, traj)
+        out["brake_force_series"] = _brake_force_series(model, traj_out)
+    return out
+
+
+def _brake_propagation(req: SimulationRequest, track: Track, scenario,
+                       modes: dict, group_milestones: list[dict],
+                       v0_mps: float, target_stop: float, s_max: float) -> dict:
+    """分组传播汇总，并以现有统一延迟模型为基线对比停车距离/最晚制动位置/余量。
+
+    统一基线 = 顶层制动力曲线 + 统一 brake_delay_s（工况 delay_s 覆盖），
+    即未提交 brake_groups 时的既有行为。
+    """
+    curves = {"service": req.service_brake, "emergency": req.emergency_brake}
+    unified_delay = (scenario.delay_s if scenario.delay_s is not None
+                     else req.brake_delay_s)
+
+    vs_unified: dict = {}
+    for mode_name, curve in curves.items():
+        g = modes[mode_name]
+        g_model = _make_grouped_force_model(req, track, scenario,
+                                            f"{mode_name}_brake")
+        u_model = _make_force_model(req, track, scenario, curve)
+        u_traj = integrate(u_model, req.initial_position_m, v0_mps, s_max)
+        u_stop_pos = u_traj.last["s_m"] if u_traj.stopped else None
+        u_stop_dist = (round(u_stop_pos - req.initial_position_m, 2)
+                       if u_stop_pos is not None else None)
+        u_margin = (round(target_stop - u_stop_pos, 2)
+                    if u_stop_pos is not None else None)
+        g_stop_dist = g["stop_distance_m"]
+        g_margin = (round(target_stop - g["stop_position_m"], 2)
+                    if g["stop_position_m"] is not None else None)
+
+        delta_d = (round(g_stop_dist - u_stop_dist, 2)
+                   if g_stop_dist is not None and u_stop_dist is not None
+                   else None)
+        delta_pct = (round(delta_d / u_stop_dist * 100.0, 2)
+                     if delta_d is not None and u_stop_dist else None)
+        delta_m = (round(g_margin - u_margin, 2)
+                   if g_margin is not None and u_margin is not None else None)
+
+        # 限速点最晚制动位置对比（同一限速点：分组 vs 统一）
+        u_zones = _low_mu_zones(u_model)
+        u_lps = _limit_points(req, track, u_model, u_traj, v0_mps, u_zones)
+        u_by_at = {p["at_m"]: p for p in u_lps}
+        lp_cmp: list[dict] = []
+        for p in g["limit_points"]:
+            u = u_by_at.get(p["at_m"], {})
+            lg, lu = p["latest_brake_m"], u.get("latest_brake_m")
+            lp_cmp.append({
+                "at_m": p["at_m"],
+                "latest_brake_grouped_m": lg,
+                "latest_brake_unified_m": lu,
+                "latest_brake_delta_m": (round(lg - lu, 1)
+                                         if lg is not None and lu is not None
+                                         else None),
+            })
+
+        vs_unified[mode_name] = {
+            "stop_distance_grouped_m": g_stop_dist,
+            "stop_distance_unified_m": u_stop_dist,
+            "stop_distance_delta_m": delta_d,
+            "stop_distance_delta_pct": delta_pct,
+            "stopping_margin_grouped_m": g_margin,
+            "stopping_margin_unified_m": u_margin,
+            "stopping_margin_delta_m": delta_m,
+            "equivalent_delay_grouped_s": round(
+                g_model.equivalent_delay_s(v0_mps), 3),
+            "equivalent_delay_unified_s": round(
+                u_model.equivalent_delay_s(v0_mps), 3),
+            "limit_points": lp_cmp,
+        }
+
+    last_group = next((g["name"] for g in group_milestones
+                       if g["is_last_to_full"]), None)
+    return {
+        "groups": group_milestones,
+        "last_to_full_group": last_group,
+        "max_full_time_s": max(g["full_time_s"] for g in group_milestones),
+        "unified_model": {"delay_s": unified_delay,
+                          "buildup_s": req.brake_buildup_s},
+        "vs_unified": vs_unified,
+    }
 
 
 def run_simulation(req: SimulationRequest, warnings: list[dict]) -> dict:
@@ -357,30 +539,52 @@ def run_simulation(req: SimulationRequest, warnings: list[dict]) -> dict:
     for sc in req.scenarios:
         modes = {}
         for mode_name, curve in curves.items():
-            model = _make_force_model(req, track, sc, curve)
+            if req.brake_groups:
+                model = _make_grouped_force_model(
+                    req, track, sc, f"{mode_name}_brake")
+            else:
+                model = _make_force_model(req, track, sc, curve)
             modes[mode_name] = _mode_result(
                 req, track, model, mode_name, v0_mps, target_stop, s_max)
+
+        # 分组制动传播：里程碑提升到工况级，并生成与统一模型的对比
+        propagation = None
+        if req.brake_groups:
+            svc_ms = modes["service"].pop("group_milestones")
+            modes["emergency"].pop("group_milestones", None)
+            propagation = _brake_propagation(
+                req, track, sc, modes, svc_ms, v0_mps, target_stop, s_max)
 
         svc = modes["service"]
         margin = (round(target_stop - svc["stop_position_m"], 2)
                   if svc["stop_position_m"] is not None else None)
-        scenario_results.append({
+        parameters: dict = {
+            "adhesion": sc.adhesion if sc.adhesion is not None else req.adhesion,
+            "adhesion_segments": (
+                [{"start_m": seg.start_m, "end_m": seg.end_m,
+                  "adhesion": seg.adhesion}
+                 for seg in sc.adhesion_segments]
+                if sc.adhesion_segments else None),
+            "brake_force_factor": sc.brake_force_factor,
+            "delay_s": (sc.delay_s if sc.delay_s is not None
+                        else req.brake_delay_s),
+        }
+        if req.brake_groups:
+            parameters["brake_groups"] = [
+                {"name": g.name, "mass_t": g.mass_t, "delay_s": g.delay_s,
+                 "buildup_s": g.buildup_s} for g in req.brake_groups]
+            parameters["group_delay_offset_s"] = (
+                sc.delay_s if sc.delay_s is not None else 0.0)
+        entry = {
             "name": sc.name,
             "is_baseline": sc is baseline,
-            "parameters": {
-                "adhesion": sc.adhesion if sc.adhesion is not None else req.adhesion,
-                "adhesion_segments": (
-                    [{"start_m": seg.start_m, "end_m": seg.end_m,
-                      "adhesion": seg.adhesion}
-                     for seg in sc.adhesion_segments]
-                    if sc.adhesion_segments else None),
-                "brake_force_factor": sc.brake_force_factor,
-                "delay_s": (sc.delay_s if sc.delay_s is not None
-                            else req.brake_delay_s),
-            },
+            "parameters": parameters,
             "stopping_margin_m": margin,
             "modes": modes,
-        })
+        }
+        if propagation is not None:
+            entry["brake_propagation"] = propagation
+        scenario_results.append(entry)
 
     # 相对基准的制动距离变化
     base_modes = next(r for r in scenario_results if r["is_baseline"])["modes"]

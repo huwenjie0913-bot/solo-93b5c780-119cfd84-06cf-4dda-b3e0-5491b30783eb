@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import io
 from typing import Any
@@ -75,6 +76,43 @@ EXAMPLE_REQUEST: dict[str, Any] = {
     "max_trajectory_points": 300,
 }
 
+
+def _grouped_example() -> dict[str, Any]:
+    """长编组分组制动传播示例：420 t 列车分为头/中/尾三组。
+
+    各组曲线按质量份额拆分（合计与顶层曲线一致），延迟 0.5/1.5/2.5 s
+    沿列车由前向后递增；统一模型（delay 1.5 s）将低估尾部晚建立
+    制动力带来的空走距离。
+    """
+    req = copy.deepcopy(EXAMPLE_REQUEST)
+    req["scenarios"] = [
+        {"name": "dry_rail", "is_baseline": True},
+        {"name": "wet_rail", "adhesion": 0.08},
+        {"name": "slow_command", "delay_s": 1.0},
+    ]
+    svc = [(0, 360), (50, 380), (80, 390), (120, 400), (160, 410)]
+    emg = [(0, 500), (50, 520), (80, 535), (120, 550), (160, 560)]
+
+    def curve(points: list[tuple[float, float]], share: float) -> dict:
+        return {"points": [{"speed": v, "force_kn": round(f * share, 1)}
+                           for v, f in points]}
+
+    req["brake_groups"] = [
+        {"name": "head", "mass_t": 60, "delay_s": 0.5, "buildup_s": 1.0,
+         "service_brake": curve(svc, 60 / 420),
+         "emergency_brake": curve(emg, 60 / 420)},
+        {"name": "middle", "mass_t": 240, "delay_s": 1.5, "buildup_s": 1.0,
+         "service_brake": curve(svc, 240 / 420),
+         "emergency_brake": curve(emg, 240 / 420)},
+        {"name": "tail", "mass_t": 120, "delay_s": 2.5, "buildup_s": 1.0,
+         "service_brake": curve(svc, 120 / 420),
+         "emergency_brake": curve(emg, 120 / 420)},
+    ]
+    return req
+
+
+EXAMPLE_GROUPED_REQUEST: dict[str, Any] = _grouped_example()
+
 # ------------------------------------------------------------------- 应用 ---
 
 app = FastAPI(
@@ -88,6 +126,11 @@ app = FastAPI(
         "支持每工况提交按里程连续的 adhesion_segments 表达落叶/渗水等"
         "局部低黏着区（缺省沿用标量 adhesion），汇总列车进出低黏着区的速度、"
         "区内最低减速度、受影响限速点与最晚制动位置前移量；"
+        "支持 brake_groups 分组制动传播：按列车前后顺序提交车辆组的质量、"
+        "制动力曲线、指令传播延迟与建立时间，积分按各组实际生效时刻汇总"
+        "制动力（仍受沿线黏着上限约束），输出各组开始响应/达到全力的时刻"
+        "与里程、全列制动力—时间序列、最后建立的车辆组，并以现有统一延迟"
+        "模型为基线对比停车距离、限速点最晚制动位置与停车余量；"
         "支持多工况对比（干轨/湿轨/部分失效），按停车余量排序。"
     ),
 )
@@ -101,7 +144,17 @@ OPENAPI_EXAMPLES = {
                        "驶出后恢复）与 900~1100 m 隧道渗水点（影响 1200 m 限速点的"
                        "最晚制动位置）。",
         "value": EXAMPLE_REQUEST,
-    }
+    },
+    "grouped_propagation": {
+        "summary": "长编组分组制动传播（头/中/尾三组，延迟递增）",
+        "description": "420 t 列车分为 head/middle/tail 三组，指令传播延迟 "
+                       "0.5/1.5/2.5 s；各组曲线按质量份额拆分（合计与顶层曲线"
+                       "一致），对比统一延迟模型可见尾部晚建立制动力带来的额外"
+                       "空走距离：停车距离变长、限速点最晚制动位置前移、停车"
+                       "余量减小。slow_command 工况演示工况级 delay_s 作为统一"
+                       "附加延迟叠加到各组传播延迟上。",
+        "value": EXAMPLE_GROUPED_REQUEST,
+    },
 }
 
 
@@ -154,11 +207,23 @@ def simulate_csv(
             "max_latest_brake_advance_m",
             "stop_distance_delta_m_vs_baseline",
             "stop_distance_delta_pct_vs_baseline", "termination_reason",
+            "brake_groups", "last_to_full_group", "max_full_time_s",
+            "equivalent_delay_grouped_s", "equivalent_delay_unified_s",
+            "stop_distance_delta_m_vs_unified",
+            "stop_distance_delta_pct_vs_unified",
+            "stopping_margin_delta_m_vs_unified",
+            "max_latest_brake_delta_m_vs_unified",
         ])
         for sc in result["scenarios"]:
             segs = sc["parameters"].get("adhesion_segments")
             seg_desc = (";".join(f"[{s['start_m']},{s['end_m']}):{s['adhesion']}"
                                  for s in segs) if segs else "")
+            prop = sc.get("brake_propagation")
+            groups_desc = ""
+            if prop is not None:
+                groups_desc = ";".join(
+                    f"{g['name']}:{g['delay_s']}s"
+                    for g in sc["parameters"]["brake_groups"])
             for mode in MODES:
                 m = sc["modes"][mode]
                 d = sc["vs_baseline"][mode]
@@ -167,6 +232,23 @@ def simulate_csv(
                 advances = [a["latest_brake_advance_m"]
                             for z in zones for a in z["affected_limit_points_m"]
                             if a["latest_brake_advance_m"] is not None]
+                if prop is not None:
+                    cmp_m = prop["vs_unified"][mode]
+                    lp_deltas = [lp["latest_brake_delta_m"]
+                                 for lp in cmp_m["limit_points"]
+                                 if lp["latest_brake_delta_m"] is not None]
+                    prop_cells: list = [
+                        groups_desc, prop["last_to_full_group"],
+                        prop["max_full_time_s"],
+                        cmp_m["equivalent_delay_grouped_s"],
+                        cmp_m["equivalent_delay_unified_s"],
+                        cmp_m["stop_distance_delta_m"],
+                        cmp_m["stop_distance_delta_pct"],
+                        cmp_m["stopping_margin_delta_m"],
+                        max(lp_deltas, key=abs) if lp_deltas else "",
+                    ]
+                else:
+                    prop_cells = ["", "", "", "", "", "", "", "", ""]
                 writer.writerow([
                     sc["rank"], sc["name"], sc["is_baseline"],
                     sc["parameters"]["adhesion"], seg_desc,
@@ -188,6 +270,7 @@ def simulate_csv(
                     max(advances) if advances else "",
                     d["stop_distance_delta_m"], d["stop_distance_delta_pct"],
                     (m["termination"] or {}).get("reason", ""),
+                    *prop_cells,
                 ])
         filename = "braking_summary.csv"
     else:

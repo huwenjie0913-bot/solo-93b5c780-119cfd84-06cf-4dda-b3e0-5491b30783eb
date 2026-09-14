@@ -1,4 +1,4 @@
-"""请求级校验：区段断裂/重叠、单位冲突、非物理参数。
+"""请求级校验：区段断裂/重叠、单位冲突、非物理参数、车辆组一致性。
 
 返回 (errors, warnings)；errors 非空时接口以 422 拒绝。
 每条问题为 {"code", "message", "location"}。
@@ -15,6 +15,7 @@ MAX_GRADE_RATIO = 0.25       # 25% 已远超任何轮轨线路
 MAX_RAIL_SPEED_KMH = 500.0   # 轮轨速度上限（含试验车）
 TYPICAL_MPS_CEILING = 70.0   # 70 m/s ≈ 252 km/h，超出则疑似单位混淆
 MAX_ADHESION_STEEL = 0.45    # 钢轮钢轨黏着系数经验上限
+GROUP_MASS_TOL_REL = 1e-3    # 车辆组质量合计与 vehicle.mass_t 的相对容差
 
 
 def _issue(code: str, message: str, location: str) -> dict:
@@ -78,6 +79,95 @@ def _check_adhesion_segments(req: SimulationRequest, si: int, segs,
                 "adhesion_segment_partial_coverage",
                 f"黏着区段 [{seg.start_m}, {seg.end_m}) m 超出线路覆盖 "
                 f"[{g_start}, {g_end}] m，界外部分按标量黏着处理", loc))
+
+
+def _check_brake_groups(req: SimulationRequest, errors: list[dict],
+                        warnings: list[dict]) -> None:
+    """校验车辆组：组名唯一、延迟沿列车单调不减（组序）、质量合计一致。"""
+    groups = req.brake_groups or []
+    to_kmh = 3.6 if req.speed_unit == "m/s" else 1.0
+
+    # 组名唯一（输出按组名定位各组）
+    seen: dict[str, int] = {}
+    for i, g in enumerate(groups):
+        if g.name in seen:
+            errors.append(_issue(
+                "duplicate_group_names",
+                f"车辆组名称 '{g.name}' 重复（第 {seen[g.name]} 组与第 {i} 组），"
+                "组名需唯一以便在输出中定位各组", f"brake_groups[{i}].name"))
+        else:
+            seen[g.name] = i
+
+    # 延迟单调不减：制动指令沿列车由前向后传播，后组不得先于前组响应
+    for i in range(1, len(groups)):
+        if groups[i].delay_s < groups[i - 1].delay_s - 1e-9:
+            errors.append(_issue(
+                "group_delay_reversed",
+                f"第 {i} 组 '{groups[i].name}' 的指令传播延迟 "
+                f"{groups[i].delay_s} s 小于前一组 '{groups[i - 1].name}' 的 "
+                f"{groups[i - 1].delay_s} s：制动指令沿列车由前向后传播，"
+                "延迟应单调不减，请检查组序是否颠倒",
+                f"brake_groups[{i}].delay_s"))
+
+    # 质量合计必须与整车质量一致
+    total = sum(g.mass_t for g in groups)
+    tol = max(1e-6, abs(req.vehicle.mass_t) * GROUP_MASS_TOL_REL)
+    if abs(total - req.vehicle.mass_t) > tol:
+        errors.append(_issue(
+            "group_mass_mismatch",
+            f"车辆组质量合计 {total:.3f} t 与 vehicle.mass_t "
+            f"{req.vehicle.mass_t} t 不一致（偏差 {total - req.vehicle.mass_t:+.3f} t，"
+            f"超出 ±{tol:.3f} t 容差）", "brake_groups"))
+
+    if len(groups) == 1:
+        warnings.append(_issue(
+            "single_brake_group",
+            "仅提交 1 个车辆组，分组传播退化为单组统一模型", "brake_groups"))
+
+    # 全力建立次序：后组先于前组达到全力（建立时间差异所致，物理可行但提示）
+    for i in range(1, len(groups)):
+        t_prev = groups[i - 1].delay_s + groups[i - 1].buildup_s
+        t_cur = groups[i].delay_s + groups[i].buildup_s
+        if t_cur < t_prev - 1e-9:
+            warnings.append(_issue(
+                "group_full_order_reversed",
+                f"第 {i} 组 '{groups[i].name}' 于 {t_cur:.2f} s 达到全力，"
+                f"早于前一组 '{groups[i - 1].name}' 的 {t_prev:.2f} s"
+                "（建立时间差异所致，物理上可行，请确认建立时间参数）",
+                f"brake_groups[{i}].buildup_s"))
+
+    # 分组制动力曲线：单组全零为警告，全部组全零则无法制动
+    all_zero = {"service_brake": True, "emergency_brake": True}
+    for i, g in enumerate(groups):
+        for attr in ("service_brake", "emergency_brake"):
+            curve = getattr(g, attr)
+            loc = f"brake_groups[{i}].{attr}"
+            if max(p.force_kn for p in curve.points) <= 0:
+                warnings.append(_issue(
+                    "group_curve_zero",
+                    f"第 {i} 组 '{g.name}' 的 {attr} 制动力曲线全为零，"
+                    "该组不提供制动力", loc))
+            else:
+                all_zero[attr] = False
+            vmax_curve = max(p.speed for p in curve.points) * to_kmh
+            if vmax_curve > MAX_RAIL_SPEED_KMH:
+                warnings.append(_issue(
+                    "unit_suspect",
+                    f"第 {i} 组 '{g.name}' 的 {attr} 曲线最大速度 "
+                    f"{vmax_curve:.0f} km/h 异常，请核对速度单位", loc))
+            fmax_n = max(p.force_kn for p in curve.points) * 1000.0
+            decel = fmax_n / (g.mass_t * 1000.0)
+            if decel > 3.0:
+                warnings.append(_issue(
+                    "non_physical_suspect",
+                    f"第 {i} 组 '{g.name}' 的 {attr} 最大减速度约 "
+                    f"{decel:.2f} m/s²，超出常规轨道车辆范围", loc))
+    for attr, label in (("service_brake", "常用"), ("emergency_brake", "紧急")):
+        if all_zero[attr]:
+            errors.append(_issue(
+                "non_physical",
+                f"所有车辆组的{label}制动力曲线全为零，无法制动",
+                "brake_groups"))
 
 
 def validate_request(req: SimulationRequest) -> tuple[list[dict], list[dict]]:
@@ -173,6 +263,10 @@ def validate_request(req: SimulationRequest) -> tuple[list[dict], list[dict]]:
             _check_adhesion_segments(
                 req, i, sc.adhesion_segments, errors, warnings,
                 g_start, g_end)
+
+    # --- 车辆组（分组制动传播） ---
+    if req.brake_groups:
+        _check_brake_groups(req, errors, warnings)
 
     # --- 制动力曲线 ---
     for name, curve in (("service_brake", req.service_brake),

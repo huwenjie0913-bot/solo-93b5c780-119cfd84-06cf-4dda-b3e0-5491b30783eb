@@ -358,3 +358,197 @@ def test_openapi_has_example():
     post = spec["paths"]["/api/simulate"]["post"]
     examples = post["requestBody"]["content"]["application/json"]["examples"]
     assert "four_scenarios" in examples
+    assert "grouped_propagation" in examples
+
+
+# ------------------------------------------------------- 分组制动传播 ---
+
+def _grouped_req() -> dict:
+    """头/中/尾三组，延迟 0.5/1.5/2.5 s 递增；曲线按质量份额拆分。"""
+    req = _req()
+    req["scenarios"] = [
+        {"name": "dry_rail", "is_baseline": True},
+        {"name": "wet_rail", "adhesion": 0.08},
+        {"name": "slow_command", "delay_s": 1.0},
+    ]
+    svc = [(0, 360), (50, 380), (80, 390), (120, 400), (160, 410)]
+    emg = [(0, 500), (50, 520), (80, 535), (120, 550), (160, 560)]
+
+    def curve(points, share):
+        return {"points": [{"speed": v, "force_kn": round(f * share, 1)}
+                           for v, f in points]}
+
+    req["brake_groups"] = [
+        {"name": "head", "mass_t": 60, "delay_s": 0.5, "buildup_s": 1.0,
+         "service_brake": curve(svc, 60 / 420),
+         "emergency_brake": curve(emg, 60 / 420)},
+        {"name": "middle", "mass_t": 240, "delay_s": 1.5, "buildup_s": 1.0,
+         "service_brake": curve(svc, 240 / 420),
+         "emergency_brake": curve(emg, 240 / 420)},
+        {"name": "tail", "mass_t": 120, "delay_s": 2.5, "buildup_s": 1.0,
+         "service_brake": curve(svc, 120 / 420),
+         "emergency_brake": curve(emg, 120 / 420)},
+    ]
+    return req
+
+
+def test_grouped_propagation_milestones():
+    body = client.post("/api/simulate", json=_grouped_req()).json()
+    sc = _scenario(body, "dry_rail")
+    prop = sc["brake_propagation"]
+    groups = prop["groups"]
+    assert [g["name"] for g in groups] == ["head", "middle", "tail"]
+    # 各组开始响应时刻 = 传播延迟；达到全力 = 延迟 + 建立时间
+    assert [g["response_time_s"] for g in groups] == [0.5, 1.5, 2.5]
+    assert [g["full_time_s"] for g in groups] == [1.5, 2.5, 3.5]
+    # 响应/全力里程随组序递增（列车在前行中依次建立）
+    assert [g["response_position_m"] for g in groups] == sorted(
+        g["response_position_m"] for g in groups)
+    assert groups[0]["response_position_m"] > 0
+    # 最后建立的车辆组为尾组
+    assert prop["last_to_full_group"] == "tail"
+    assert prop["max_full_time_s"] == 3.5
+    assert [g["is_last_to_full"] for g in groups] == [False, False, True]
+    assert prop["unified_model"] == {"delay_s": 1.5, "buildup_s": 1.0}
+
+
+def test_grouped_force_time_series():
+    body = client.post("/api/simulate", json=_grouped_req()).json()
+    svc = _scenario(body, "dry_rail")["modes"]["service"]
+    series = svc["brake_force_series"]
+    assert len(series) == len(svc["trajectory"])
+    # 传播早期：头组已出力，尾组尚未响应
+    early = next(p for p in series if 0.6 <= p["t_s"] < 2.5)
+    assert early["group_forces_kn"]["head"] > 0
+    assert early["group_forces_kn"]["tail"] == 0
+    # 首组响应前全列无力
+    assert all(p["total_force_kn"] == 0 for p in series if p["t_s"] < 0.5)
+    # 各组之和等于全列合力；全力期合力接近曲线值（400 kN @120 km/h）
+    for p in series:
+        assert abs(sum(p["group_forces_kn"].values())
+                   - p["total_force_kn"]) < 0.05
+    assert 390 <= max(p["total_force_kn"] for p in series) <= 405
+
+
+def test_grouped_vs_unified_comparison():
+    body = client.post("/api/simulate", json=_grouped_req()).json()
+    prop = _scenario(body, "dry_rail")["brake_propagation"]
+    su = prop["vs_unified"]["service"]
+    # 统一模型低估空走距离：分组停车距离更长、余量更小
+    assert su["stop_distance_delta_m"] > 0
+    assert su["stop_distance_delta_pct"] > 0
+    assert su["stopping_margin_delta_m"] < 0
+    assert su["stop_distance_grouped_m"] > su["stop_distance_unified_m"]
+    # 分组等效延迟（力加权）大于统一延迟
+    assert su["equivalent_delay_grouped_s"] > su["equivalent_delay_unified_s"]
+    # 限速点最晚制动位置前移（分组值更小）
+    lp = {p["at_m"]: p for p in su["limit_points"]}
+    assert lp[1200]["latest_brake_delta_m"] < 0
+    assert lp[1200]["latest_brake_grouped_m"] < lp[1200]["latest_brake_unified_m"]
+    # 紧急制动模式同样有对比
+    assert prop["vs_unified"]["emergency"]["stop_distance_delta_m"] > 0
+
+
+def test_grouped_matches_unified_when_delays_equal():
+    """各组延迟/建立相同且曲线按质量拆分时，分组模型退化为统一模型。"""
+    req = _grouped_req()
+    req["scenarios"] = [{"name": "dry_rail", "is_baseline": True}]
+    for g in req["brake_groups"]:
+        g["delay_s"] = 1.5
+        g["buildup_s"] = 1.0
+    body = client.post("/api/simulate", json=req).json()
+    su = _scenario(body, "dry_rail")["brake_propagation"]["vs_unified"]["service"]
+    assert abs(su["stop_distance_delta_m"]) < 0.5
+    assert su["equivalent_delay_grouped_s"] == su["equivalent_delay_unified_s"]
+
+
+def test_grouped_scenario_delay_offset():
+    """工况级 delay_s 作为统一附加延迟叠加到各组传播延迟上。"""
+    body = client.post("/api/simulate", json=_grouped_req()).json()
+    sc = _scenario(body, "slow_command")
+    assert sc["parameters"]["group_delay_offset_s"] == 1.0
+    times = [g["response_time_s"] for g in sc["brake_propagation"]["groups"]]
+    assert times == [1.5, 2.5, 3.5]
+
+
+def test_no_groups_keeps_original_behavior():
+    body = client.post("/api/simulate", json=_req()).json()
+    for sc in body["scenarios"]:
+        assert "brake_propagation" not in sc
+        assert "brake_groups" not in sc["parameters"]
+        for mode in ("service", "emergency"):
+            assert "brake_force_series" not in sc["modes"][mode]
+
+
+def test_group_mass_mismatch_rejected():
+    req = _grouped_req()
+    req["brake_groups"][2]["mass_t"] = 130  # 合计 430 ≠ 420
+    r = client.post("/api/simulate", json=req)
+    assert r.status_code == 422
+    errs = r.json()["detail"]["errors"]
+    assert any(e["code"] == "group_mass_mismatch"
+               and e["location"] == "brake_groups" for e in errs)
+
+
+def test_group_delay_reversed_rejected():
+    req = _grouped_req()
+    req["brake_groups"][2]["delay_s"] = 0.1  # 尾组先于前组响应：组序颠倒
+    r = client.post("/api/simulate", json=req)
+    assert r.status_code == 422
+    errs = r.json()["detail"]["errors"]
+    assert any(e["code"] == "group_delay_reversed"
+               and e["location"] == "brake_groups[2].delay_s" for e in errs)
+
+
+def test_duplicate_group_names_rejected():
+    req = _grouped_req()
+    req["brake_groups"][1]["name"] = "head"
+    r = client.post("/api/simulate", json=req)
+    assert r.status_code == 422
+    errs = r.json()["detail"]["errors"]
+    assert any(e["code"] == "duplicate_group_names"
+               and e["location"] == "brake_groups[1].name" for e in errs)
+
+
+def test_group_all_zero_curves_rejected():
+    req = _grouped_req()
+    for g in req["brake_groups"]:
+        g["service_brake"] = {"points": [{"speed": 0, "force_kn": 0},
+                                         {"speed": 100, "force_kn": 0}]}
+    _assert_422(req, "non_physical")
+
+
+def test_group_warnings():
+    # 单组退化
+    req = _grouped_req()
+    req["brake_groups"] = [req["brake_groups"][0]]
+    req["vehicle"]["mass_t"] = 60
+    body = client.post("/api/simulate", json=req).json()
+    codes = [w["code"] for w in body["validation"]["warnings"]]
+    assert "single_brake_group" in codes
+    # 后组先于前组达到全力（建立时间差异）
+    req = _grouped_req()
+    req["brake_groups"][0]["buildup_s"] = 5.0  # 头组 0.5+5.0=5.5 > 尾组 2.5+1.0
+    body = client.post("/api/simulate", json=req).json()
+    codes = [w["code"] for w in body["validation"]["warnings"]]
+    assert "group_full_order_reversed" in codes
+
+
+def test_grouped_csv_summary_has_propagation_columns():
+    r = client.post("/api/simulate/csv?kind=summary", json=_grouped_req())
+    assert r.status_code == 200
+    header = r.text.splitlines()[0]
+    for col in ("brake_groups", "last_to_full_group", "max_full_time_s",
+                "equivalent_delay_grouped_s", "equivalent_delay_unified_s",
+                "stop_distance_delta_m_vs_unified",
+                "stop_distance_delta_pct_vs_unified",
+                "stopping_margin_delta_m_vs_unified",
+                "max_latest_brake_delta_m_vs_unified"):
+        assert col in header, col
+    rows = [ln for ln in r.text.splitlines() if ",dry_rail," in ln]
+    assert len(rows) == 2
+    assert all(",tail," in ln for ln in rows)
+    # 无分组请求：传播列存在但为空
+    r2 = client.post("/api/simulate/csv?kind=summary", json=_req())
+    row = r2.text.splitlines()[1]
+    assert row.endswith("," * 9)

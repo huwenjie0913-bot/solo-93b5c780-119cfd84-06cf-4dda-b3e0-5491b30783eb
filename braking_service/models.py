@@ -122,6 +122,58 @@ class BrakeGroup(BaseModel):
     emergency_brake: BrakeCurve = Field(..., description="该组紧急制动力曲线")
 
 
+class SupervisionThreshold(BaseModel):
+    """单级监督阈值的误差与接管裕量配置。
+
+    三级阈值分别为：告警（warning）、常用制动介入（service）、
+    紧急制动介入（emergency）。每级可独立配置：
+    - speed_error：速度测量误差（按 speed_unit，按不利方向取测速偏低）；
+    - position_error_m：里程测量误差 (m)，按不利方向取显示里程偏小
+      （列车实际位置比显示更靠近限速点）；
+    - trigger_delay_s：触发延迟 (s)（系统反应/指令建立附加延迟）；
+    - min_takeover_distance_m / min_takeover_time_s：与更内一级曲线之间
+      的最小接管裕量（距离 m / 时间 s）；紧急级的裕量指紧急介入曲线到
+      限速点之间的最小余量。
+    """
+
+    speed_error: float = Field(
+        0.0, ge=0, le=50, description="速度测量误差（按 speed_unit，按测速偏低计入）")
+    position_error_m: float = Field(
+        0.0, ge=0, le=500, description="里程测量误差 (m)，按定位偏大计入")
+    trigger_delay_s: float = Field(
+        0.0, ge=0, le=60, description="触发延迟 (s)，额外空走时间按接近速度折算距离")
+    min_takeover_distance_m: float = Field(
+        0.0, ge=0, le=5000, description="与更内一级曲线的最小接管距离裕量 (m)")
+    min_takeover_time_s: float = Field(
+        0.0, ge=0, le=300, description="与更内一级曲线的最小接管时间裕量 (s)")
+
+
+class SupervisionConfig(BaseModel):
+    """限速监督包络配置：三级阈值 + 名称（用于双配置对比）。
+
+    告警曲线在常用全制动反推曲线基础上额外前置 warning.trigger_delay_s；
+    常用/紧急曲线分别以常用/紧急全制动反推曲线为基准，各自叠加本级
+    触发延迟。误差一律按不利方向计入：测速偏低使有效触发速度抬高，
+    里程显示偏小与触发延迟使触发位置向限速点方向后移。
+    """
+
+    name: str = Field(
+        "default", min_length=1, max_length=64,
+        description="配置名称（对比两套配置时据此标识）")
+    warning: SupervisionThreshold = Field(
+        default_factory=SupervisionThreshold,
+        description="告警阈值（驾驶员接管提示）")
+    service: SupervisionThreshold = Field(
+        default_factory=SupervisionThreshold,
+        description="常用制动介入阈值")
+    emergency: SupervisionThreshold = Field(
+        default_factory=SupervisionThreshold,
+        description="紧急制动介入阈值")
+    max_curve_points: int = Field(
+        80, ge=10, le=500,
+        description="每条触发曲线在 JSON 中返回的最大采样点数")
+
+
 class Scenario(BaseModel):
     """工况：覆盖基准参数以模拟干轨/湿轨/部分制动失效等。"""
 
@@ -186,6 +238,23 @@ class SimulationRequest(BaseModel):
     )
     max_trajectory_points: int = Field(
         300, ge=10, le=2000, description="每条轨迹在 JSON 中返回的最大采样点数"
+    )
+
+    supervision: Optional[SupervisionConfig] = Field(
+        None,
+        description=(
+            "限速监督包络配置：分别配置告警/常用/紧急三级阈值的速度测量误差、"
+            "里程误差、触发延迟与最小接管裕量；沿每个限速收紧点反推生成三条"
+            "速度—里程触发曲线，按不利方向计入误差并校核曲线次序、交叉与"
+            "接管裕量。缺省（null）时不输出监督结果，与旧请求完全兼容"
+        ),
+    )
+    alternative_supervision: Optional[SupervisionConfig] = Field(
+        None,
+        description=(
+            "第二套监督阈值配置，用于与 supervision 对比触发区间与接管空间的"
+            "变化；仅在同时提交 supervision 时生效，且两者 name 不得相同"
+        ),
     )
 
     @model_validator(mode="after")

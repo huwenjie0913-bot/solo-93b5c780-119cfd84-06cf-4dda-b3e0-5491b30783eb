@@ -264,6 +264,57 @@ def validate_request(req: SimulationRequest) -> tuple[list[dict], list[dict]]:
                 req, i, sc.adhesion_segments, errors, warnings,
                 g_start, g_end)
 
+    # --- 限速监督包络 ---
+    if req.alternative_supervision is not None and req.supervision is None:
+        errors.append(_issue(
+            "supervision_config_missing",
+            "提交 alternative_supervision 时必须同时提交 supervision"
+            "（第二套配置仅用于与主配置对比）",
+            "alternative_supervision"))
+    if req.supervision is not None and req.alternative_supervision is not None:
+        if req.supervision.name == req.alternative_supervision.name:
+            errors.append(_issue(
+                "duplicate_supervision_names",
+                f"两套监督配置名称相同（'{req.supervision.name}'），"
+                "对比结果无法区分配置",
+                "alternative_supervision.name"))
+    # 误差/延迟合理性警告（不影响计算）
+    vscale = 1.0 / 3.6 if req.speed_unit == "km/h" else 1.0
+    for field_name, cfg in (("supervision", req.supervision),
+                            ("alternative_supervision",
+                             req.alternative_supervision)):
+        if cfg is None:
+            continue
+        for lv in ("warning", "service", "emergency"):
+            t = getattr(cfg, lv)
+            loc = f"{field_name}.{lv}"
+            if t.speed_error * vscale > 5.0:
+                warnings.append(_issue(
+                    "non_physical_suspect",
+                    f"监督配置 '{cfg.name}' 的 {lv} 级速度测量误差 "
+                    f"{t.speed_error} {req.speed_unit} 偏大（>18 km/h），"
+                    "请核对单位与取值", f"{loc}.speed_error"))
+            if t.position_error_m > 100.0:
+                warnings.append(_issue(
+                    "non_physical_suspect",
+                    f"监督配置 '{cfg.name}' 的 {lv} 级里程测量误差 "
+                    f"{t.position_error_m} m 偏大（>100 m）",
+                    f"{loc}.position_error_m"))
+    # 触发延迟次序：告警应不早于常用、常用不早于紧急（延迟倒置会产生交叉）
+    if req.supervision is not None:
+        cfg = req.supervision
+        outer, inner = (("warning", "service"), ("service", "emergency"))
+        for o, i in (outer, inner):
+            if getattr(cfg, o).trigger_delay_s \
+                    < getattr(cfg, i).trigger_delay_s - 1e-9:
+                warnings.append(_issue(
+                    "supervision_delay_order",
+                    f"监督配置 '{cfg.name}' 的 {o} 级触发延迟 "
+                    f"{getattr(cfg, o).trigger_delay_s} s 小于 {i} 级 "
+                    f"{getattr(cfg, i).trigger_delay_s} s，"
+                    "三级曲线可能次序倒置/交叉",
+                    f"supervision.{o}.trigger_delay_s"))
+
     # --- 车辆组（分组制动传播） ---
     if req.brake_groups:
         _check_brake_groups(req, errors, warnings)

@@ -24,6 +24,14 @@
   按停车余量升序返回（无法停车者排最前），并给出相对基准工况的制动距离变化；
 - **失败保护**：数值积分终止（如制动力不足、超出计算域）时保留已算轨迹，
   并报告终止位置与原因；
+- **限速监督包络**：提交 `supervision` 后，请求可分别配置**告警、常用制动
+  介入、紧急制动介入**三类阈值的速度测量误差、里程误差、触发延迟与最小
+  接管裕量；沿每个限速收紧点调用现有 RK4 反向求解生成三条速度—里程触发
+  曲线，误差按不利方向计入（测速偏低、里程显示偏小、触发延迟折算空走
+  距离），检查曲线次序、交叉和裕量不足，返回问题里程、关联限速点、最小
+  距离与时间裕量及原因；可同时提交 `alternative_supervision` 对比两套
+  阈值配置，列出触发区间与接管空间的变化及新增/消除的问题；未提交监督
+  配置时响应结构与数值结果完全不变；
 - **双格式输出**：结构化 JSON + 可下载 CSV（轨迹明细 / 工况汇总）。
 
 ## 运行
@@ -120,20 +128,66 @@ m_eff · dv/dt = -( F_brake(v,t) + F_rr(v) + F_grade(s) )
 - CSV 轨迹增加 `adhesion` 列；汇总 CSV 增加黏着分段描述、低黏着区、
   进出速度、区内最低减速度、受影响限速点与最大前移量等列。
 
+### 限速监督包络输入与输出
+
+`supervision` 含三级阈值 `warning` / `service` / `emergency`，每级独立
+配置：
+
+- `speed_error`：速度测量误差（按请求 `speed_unit`，内部换算 m/s）；
+- `position_error_m`：里程测量误差 (m)；
+- `trigger_delay_s`：触发延迟（系统反应附加空走时间）；
+- `min_takeover_distance_m` / `min_takeover_time_s`：与更内一级曲线之间
+  的最小接管距离/时间裕量（紧急级指到限速点的余量）。
+
+三条曲线的生成：告警与常用曲线以**常用全制动**反推曲线为基准（告警再
+额外前置 `warning.trigger_delay_s`），紧急曲线以**紧急全制动**反推曲线
+为基准；名义触发位置在性能曲线上扣减车辆等效延迟（统一模型
+`delay + buildup/2`，分组模型按组力加权）与本级触发延迟的空走距离。
+误差一律按不利方向计入：测速偏低 ⇒ `s_eff(v) = s_nom(v − Δv)`；
+里程显示偏小 ⇒ `s_eff(v) = s_nom(v) + Δs`，均使触发位置向限速点后移。
+
+每个工况增加 `supervision`：
+
+- `limit_points[]`：每个限速收紧点（放宽点标记 `skipped`）的三条曲线
+  采样点 `curve`、接近速度处名义/有效触发位置、各误差导致的后移量、
+  三级触发区间（告警→常用→紧急→限速点）与逐对 `checks`；
+- `checks`：每对相邻曲线的最小距离/时间裕量（及其对应速度）、要求值
+  与缺口、交叉点；
+- `problems[]`：`curve_infeasible`（反推不可达/计入误差后越出线路起点）、
+  `curve_crossing`（外级越过内级，监督次序不成立）、
+  `takeover_margin_insufficient`（距离或时间裕量不足）；每条含
+  `problem_mileage_m`、`at_m`（关联限速点）、`limit_kmh`、
+  `min_distance_m`、`min_time_s` 与中文 `reason`；
+- `min_takeover`：跨限速点的最小警告→常用、常用→紧急、紧急→限速点
+  距离/时间裕量。
+
+提交 `alternative_supervision`（两套配置 `name` 不得相同）时，每个工况
+增加 `supervision_comparison`：逐限速点列出三级触发位置与触发区间的
+变化、各对接管距离/时间裕量变化、新增与消除的问题，汇总最大前移/后移
+量与问题计数。
+
+CSV：提交监督配置后，轨迹 CSV 增加 `warning_threshold_kmh` /
+`service_threshold_kmh` / `emergency_threshold_kmh` 三列（按常用包络在
+该里程插值）；汇总 CSV 增加监督配置名、问题数、三对最小接管裕量、
+三级触发位置与触发区间，以及对比配置的触发/裕量变化与问题计数列。
+未提交 `supervision` 时 JSON 与 CSV 的结构和数值均与旧版本一致。
+
 ## 项目结构
 
 ```
 braking_service/
-  models.py      # Pydantic 请求模型（单位、区段、曲线、工况）
-  validation.py  # 断裂/重叠/单位冲突/非物理参数校验
-  physics.py     # RK4 积分、反向制动曲线、超速扫描
-  simulator.py   # 工况编排、限速点分析、余量排序、基准对比
-  main.py        # FastAPI 入口（JSON / CSV / OpenAPI 示例）
+  models.py       # Pydantic 请求模型（单位、区段、曲线、工况、监督配置）
+  validation.py   # 断裂/重叠/单位冲突/非物理参数校验
+  physics.py      # RK4 积分、反向制动曲线（位置/完整曲线）、超速扫描
+  simulator.py    # 工况编排、限速点分析、余量排序、基准对比
+  supervision.py  # 三级监督触发曲线、误差不利方向、次序/交叉/裕量校核、对比
+  main.py         # FastAPI 入口（JSON / CSV / OpenAPI 示例）
 tests/test_api.py
+tests/test_supervision.py
 ```
 
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 38 个用例
+.venv/bin/python -m pytest tests/ -q   # 56 个用例
 ```

@@ -15,6 +15,7 @@ from .models import SimulationRequest
 from .physics import (GRAVITY, BrakeGroupSpec, ForceModel, Trajectory,
                       backward_brake_position, downsample, integrate,
                       scan_violations)
+from .supervision import build_envelope, compare_envelopes
 
 MODES = ("service", "emergency")
 
@@ -531,21 +532,26 @@ def run_simulation(req: SimulationRequest, warnings: list[dict]) -> dict:
     # 计算域：覆盖终点后再留缓冲，保证能判定"无法停车"
     s_max = max(track.end_m, target_stop) + max(2000.0, 0.5 * (track.end_m - track.start_m))
 
-    curves = {"service": req.service_brake, "emergency": req.emergency_brake}
-
     baseline = next((s for s in req.scenarios if s.is_baseline), req.scenarios[0])
 
     scenario_results = []
     for sc in req.scenarios:
-        modes = {}
-        for mode_name, curve in curves.items():
-            if req.brake_groups:
-                model = _make_grouped_force_model(
-                    req, track, sc, f"{mode_name}_brake")
-            else:
-                model = _make_force_model(req, track, sc, curve)
-            modes[mode_name] = _mode_result(
-                req, track, model, mode_name, v0_mps, target_stop, s_max)
+        # 两种制动模式的合力模型（监督包络也复用这两个模型反推触发曲线）
+        if req.brake_groups:
+            model_svc = _make_grouped_force_model(
+                req, track, sc, "service_brake")
+            model_emg = _make_grouped_force_model(
+                req, track, sc, "emergency_brake")
+        else:
+            model_svc = _make_force_model(req, track, sc, req.service_brake)
+            model_emg = _make_force_model(req, track, sc, req.emergency_brake)
+
+        modes = {
+            "service": _mode_result(
+                req, track, model_svc, "service", v0_mps, target_stop, s_max),
+            "emergency": _mode_result(
+                req, track, model_emg, "emergency", v0_mps, target_stop, s_max),
+        }
 
         # 分组制动传播：里程碑提升到工况级，并生成与统一模型的对比
         propagation = None
@@ -584,6 +590,19 @@ def run_simulation(req: SimulationRequest, warnings: list[dict]) -> dict:
         }
         if propagation is not None:
             entry["brake_propagation"] = propagation
+
+        # 限速监督包络：未提交 supervision 时不输出任何监督字段
+        if req.supervision is not None:
+            envelope = build_envelope(
+                req, track, req.supervision, model_svc, model_emg)
+            entry["supervision"] = envelope
+            if req.alternative_supervision is not None:
+                alt_envelope = build_envelope(
+                    req, track, req.alternative_supervision,
+                    model_svc, model_emg)
+                entry["supervision_comparison"] = compare_envelopes(
+                    envelope, alt_envelope)
+
         scenario_results.append(entry)
 
     # 相对基准的制动距离变化

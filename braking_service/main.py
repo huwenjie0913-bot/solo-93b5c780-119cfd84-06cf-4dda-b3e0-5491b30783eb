@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from . import __version__
 from .models import SimulationRequest
 from .simulator import MODES, run_simulation
+from .supervision import LEVELS as SUPERVISION_LEVELS, threshold_speeds_kmh
 from .validation import validate_request
 
 # ---------------------------------------------------------------- 示例请求 ---
@@ -113,6 +114,64 @@ def _grouped_example() -> dict[str, Any]:
 
 EXAMPLE_GROUPED_REQUEST: dict[str, Any] = _grouped_example()
 
+
+def _supervision_example() -> dict[str, Any]:
+    """限速监督包络示例：三级阈值 + 新旧两套配置对比。
+
+    名义配置（nominal）误差与延迟较小；老化设备配置（aged_equipment）
+    测速/定位误差更大、系统反应更慢，对比可见三级触发位置向限速点方向
+    后移、接管窗口收窄；大下坡段前的 1200 m 收紧点还可能出现
+    告警曲线不可达或接管裕量不足。
+    """
+    req = copy.deepcopy(EXAMPLE_REQUEST)
+    req["scenarios"] = [
+        {"name": "dry_rail", "is_baseline": True},
+        {"name": "wet_rail", "adhesion": 0.08, "brake_force_factor": 0.9},
+        {
+            "name": "leaf_film_tunnel",
+            "adhesion_segments": [
+                {"start_m": 250, "end_m": 450, "adhesion": 0.06},
+                {"start_m": 450, "end_m": 900, "adhesion": 0.15},
+                {"start_m": 900, "end_m": 1100, "adhesion": 0.06},
+            ],
+        },
+    ]
+    req["target_stop_m"] = 1000
+    req["supervision"] = {
+        "name": "nominal",
+        "warning": {"speed_error": 2.0, "position_error_m": 5.0,
+                    "trigger_delay_s": 4.0,
+                    "min_takeover_distance_m": 30.0,
+                    "min_takeover_time_s": 1.0},
+        "service": {"speed_error": 2.0, "position_error_m": 5.0,
+                    "trigger_delay_s": 1.2,
+                    "min_takeover_distance_m": 10.0,
+                    "min_takeover_time_s": 0.5},
+        "emergency": {"speed_error": 2.0, "position_error_m": 5.0,
+                      "trigger_delay_s": 0.6,
+                      "min_takeover_distance_m": 0.0,
+                      "min_takeover_time_s": 0.0},
+    }
+    req["alternative_supervision"] = {
+        "name": "aged_equipment",
+        "warning": {"speed_error": 5.0, "position_error_m": 15.0,
+                    "trigger_delay_s": 6.0,
+                    "min_takeover_distance_m": 30.0,
+                    "min_takeover_time_s": 1.0},
+        "service": {"speed_error": 5.0, "position_error_m": 15.0,
+                    "trigger_delay_s": 2.5,
+                    "min_takeover_distance_m": 10.0,
+                    "min_takeover_time_s": 0.5},
+        "emergency": {"speed_error": 5.0, "position_error_m": 15.0,
+                      "trigger_delay_s": 1.2,
+                      "min_takeover_distance_m": 0.0,
+                      "min_takeover_time_s": 0.0},
+    }
+    return req
+
+
+EXAMPLE_SUPERVISION_REQUEST: dict[str, Any] = _supervision_example()
+
 # ------------------------------------------------------------------- 应用 ---
 
 app = FastAPI(
@@ -132,6 +191,11 @@ app = FastAPI(
         "与里程、全列制动力—时间序列、最后建立的车辆组，并以现有统一延迟"
         "模型为基线对比停车距离、限速点最晚制动位置与停车余量；"
         "支持多工况对比（干轨/湿轨/部分失效），按停车余量排序。"
+        "提交 supervision 后，沿每个限速收紧点以 RK4 反向求解生成告警/常用/"
+        "紧急三条速度—里程触发曲线，按不利方向计入速度/里程测量误差与触发"
+        "延迟，校核曲线次序、交叉与最小接管裕量，返回问题里程、关联限速点、"
+        "最小距离与时间裕量及原因；可同时提交 alternative_supervision 对比"
+        "两套阈值配置的触发区间与接管空间变化。未提交监督配置时输出结构不变。"
     ),
 )
 
@@ -155,6 +219,14 @@ OPENAPI_EXAMPLES = {
                        "附加延迟叠加到各组传播延迟上。",
         "value": EXAMPLE_GROUPED_REQUEST,
     },
+    "speed_supervision": {
+        "summary": "限速监督包络（三级触发曲线 + 两套阈值配置对比）",
+        "description": "告警/常用/紧急三级阈值分别配置速度误差、里程误差、"
+                       "触发延迟与最小接管裕量；主配置 nominal 与老化设备 "
+                       "aged_equipment 对比，展示触发位置后移、接管窗口收窄 "
+                       "与新增/消除的监督问题。",
+        "value": EXAMPLE_SUPERVISION_REQUEST,
+    },
 }
 
 
@@ -167,6 +239,85 @@ def _execute(req: SimulationRequest) -> dict:
                     "warnings": warnings},
         )
     return run_simulation(req, warnings)
+
+
+# ------------------------------------------------------- CSV 监督列辅助 ---
+
+SUPERVISION_SUMMARY_COLUMNS = [
+    "supervision_config", "supervision_problem_count",
+    "sup_min_takeover_warning_service_m",
+    "sup_min_takeover_service_emergency_m",
+    "sup_min_takeover_emergency_limit_m",
+    "sup_min_takeover_warning_service_s",
+    "sup_min_takeover_service_emergency_s",
+    "sup_trigger_warning_m", "sup_trigger_service_m",
+    "sup_trigger_emergency_m",
+    "sup_window_warning_m", "sup_window_service_m",
+    "sup_window_emergency_m",
+    "sup_alt_config", "sup_alt_trigger_delta_min_m",
+    "sup_alt_takeover_distance_delta_min_m",
+    "sup_alt_takeover_time_delta_min_s",
+    "sup_alt_new_problem_count", "sup_alt_resolved_problem_count",
+]
+
+
+def _agg(values):
+    """数值列表的最小值（None 视为缺失）；全缺失返回空串。"""
+    vals = [v for v in values if v is not None]
+    return round(min(vals), 2) if vals else ""
+
+
+def _supervision_summary_cells(sc: dict) -> list:
+    """工况级监督包络汇总（同一工况的 service/emergency 两行取值相同）。"""
+    sup = sc.get("supervision")
+    if sup is None:
+        return [""] * len(SUPERVISION_SUMMARY_COLUMNS)
+    pts = [p for p in sup["limit_points"] if not p.get("skipped")]
+    mt = sup["min_takeover"]
+
+    def mtv(pair: str, key: str):
+        return mt.get(pair, {}).get(key)
+
+    triggers = {lv: [p["trigger_positions_m"][lv] for p in pts]
+                for lv in SUPERVISION_LEVELS}
+    windows = {k: [p["trigger_intervals_m"][k] for p in pts] for k in
+               ("warning_window_m", "service_window_m",
+                "emergency_window_m")}
+
+    cmp_ = sc.get("supervision_comparison")
+    if cmp_ is not None:
+        trig_deltas = [t["delta_m"] for p in cmp_["limit_points"]
+                       for t in p["trigger_positions"].values()]
+        to_d = [c["distance_delta_m"] for p in cmp_["limit_points"]
+                for c in p["takeover"].values()]
+        tt_d = [c["time_delta_s"] for p in cmp_["limit_points"]
+                for c in p["takeover"].values()]
+        cells = [
+            cmp_["alternative_config"],
+            _agg(trig_deltas),
+            _agg(to_d),
+            _agg(tt_d),
+            cmp_["summary"]["new_problem_count"],
+            cmp_["summary"]["resolved_problem_count"],
+        ]
+    else:
+        cells = ["", "", "", "", "", ""]
+
+    return [
+        sup["config"]["name"], sup["problem_count"],
+        mtv("warning_to_service", "distance_m") or "",
+        mtv("service_to_emergency", "distance_m") or "",
+        mtv("emergency_to_limit_point", "distance_m") or "",
+        mtv("warning_to_service", "time_s") or "",
+        mtv("service_to_emergency", "time_s") or "",
+        _agg(triggers["warning"]),
+        _agg(triggers["service"]),
+        _agg(triggers["emergency"]),
+        _agg(windows["warning_window_m"]),
+        _agg(windows["service_window_m"]),
+        _agg(windows["emergency_window_m"]),
+        *cells,
+    ]
 
 
 @app.post(
@@ -193,8 +344,9 @@ def simulate_csv(
 
     buf = io.StringIO()
     writer = csv.writer(buf)
+    has_supervision = any("supervision" in sc for sc in result["scenarios"])
     if kind == "summary":
-        writer.writerow([
+        header = [
             "rank", "scenario", "is_baseline", "adhesion",
             "adhesion_segments",
             "brake_force_factor", "delay_s", "mode", "status",
@@ -213,7 +365,10 @@ def simulate_csv(
             "stop_distance_delta_pct_vs_unified",
             "stopping_margin_delta_m_vs_unified",
             "max_latest_brake_delta_m_vs_unified",
-        ])
+        ]
+        if has_supervision:
+            header += SUPERVISION_SUMMARY_COLUMNS
+        writer.writerow(header)
         for sc in result["scenarios"]:
             segs = sc["parameters"].get("adhesion_segments")
             seg_desc = (";".join(f"[{s['start_m']},{s['end_m']}):{s['adhesion']}"
@@ -249,7 +404,7 @@ def simulate_csv(
                     ]
                 else:
                     prop_cells = ["", "", "", "", "", "", "", "", ""]
-                writer.writerow([
+                row = [
                     sc["rank"], sc["name"], sc["is_baseline"],
                     sc["parameters"]["adhesion"], seg_desc,
                     sc["parameters"]["brake_force_factor"],
@@ -271,22 +426,41 @@ def simulate_csv(
                     d["stop_distance_delta_m"], d["stop_distance_delta_pct"],
                     (m["termination"] or {}).get("reason", ""),
                     *prop_cells,
-                ])
+                ]
+                if has_supervision:
+                    row += _supervision_summary_cells(sc)
+                writer.writerow(row)
         filename = "braking_summary.csv"
     else:
-        writer.writerow([
+        traj_header = [
             "scenario", "mode", "t_s", "s_m", "v_mps", "v_kmh",
             "a_mps2", "adhesion", "grade_permille", "limit_kmh",
-        ])
+        ]
+        if has_supervision:
+            traj_header += ["warning_threshold_kmh",
+                            "service_threshold_kmh",
+                            "emergency_threshold_kmh"]
+        writer.writerow(traj_header)
         for sc in result["scenarios"]:
+            envelope = sc.get("supervision")
             for mode in MODES:
                 for p in sc["modes"][mode]["trajectory"]:
-                    writer.writerow([
+                    row = [
                         sc["name"], mode, p["t_s"], p["s_m"], p["v_mps"],
                         p["v_kmh"], p["a_mps2"], p["adhesion"],
                         p["grade_permille"],
                         p["limit_kmh"] if p["limit_kmh"] is not None else "",
-                    ])
+                    ]
+                    if has_supervision:
+                        # 监督触发阈值按常用包络标注（三级曲线来源一致，
+                        # 与制动模式无关）
+                        thr = (threshold_speeds_kmh(envelope, p["s_m"])
+                               if envelope is not None and mode == "service"
+                               else None)
+                        row += [thr["warning"] if thr else "",
+                                thr["service"] if thr else "",
+                                thr["emergency"] if thr else ""]
+                    writer.writerow(row)
         filename = "braking_trajectories.csv"
 
     buf.seek(0)

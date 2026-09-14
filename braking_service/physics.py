@@ -233,6 +233,18 @@ def integrate(model: ForceModel, s0: float, v0: float, s_max: float,
     return finish(False, "terminated", "max_steps_exceeded: 积分步数超限")
 
 
+def _backward_step(model: ForceModel, s: float, v: float,
+                   ds: float) -> tuple[float, float, float]:
+    """单个反向 Euler 步（沿里程）：返回 (new_s, new_v, decel)。
+
+    decel <= 1e-6 表示当前位置制动力无法克服下坡与阻力，调用方应终止反推。
+    """
+    decel = -model.accel(1e9, s, v)  # t 取大 => 延迟与建立期已过，全制动
+    if decel <= 1e-6:
+        return s, v, decel
+    return s - ds, v + decel / v * ds, decel
+
+
 def backward_brake_position(model: ForceModel, s_from: float, v_from: float,
                             v_target: float, s_min: float
                             ) -> tuple[Optional[float], str, float]:
@@ -249,15 +261,14 @@ def backward_brake_position(model: ForceModel, s_from: float, v_from: float,
     min_s = s
     steps = 0
     while s > s_min:
-        decel = -model.accel(1e9, s, v)  # t 取大 => 延迟与建立期已过，全制动
+        ns, nv, decel = _backward_step(model, s, v, BACKWARD_DS)
         if decel <= 1e-6:
             return None, (
                 f"brake_insufficient: 在 s={s:.1f} m 处制动力无法克服下坡与阻力，"
                 "无法继续反向减速"
             ), min_s
         prev_s, prev_v = s, v
-        v += decel / v * BACKWARD_DS
-        s -= BACKWARD_DS
+        s, v = ns, nv
         min_s = min(min_s, s)
         steps += 1
         if v >= v_target:
@@ -267,6 +278,50 @@ def backward_brake_position(model: ForceModel, s_from: float, v_from: float,
         if steps > 2_000_000:
             return None, "backward_steps_exceeded", min_s
     return (None,
+            f"track_start_reached: 反推至里程 {s_min:.0f} m 仍未达到接近速度",
+            min_s)
+
+
+def backward_brake_curve(model: ForceModel, s_from: float, v_from: float,
+                         v_target: float, s_min: float,
+                         ds: float = BACKWARD_DS
+                         ) -> tuple[list[tuple[float, float]], str, float]:
+    """反向积分全制动曲线，返回完整的速度—里程点列（供监督包络使用）。
+
+    与 backward_brake_position 采用完全相同的步进公式，区别在于保留每一步：
+    点列从限速点 (s_from, v_from) 起向外排列（里程递减、速度递增），末点
+    线性插值到 v_target。
+
+    返回 (points, note, 反推到达的最小里程)，note 取值：
+    - "ok"：曲线在可用里程内达到 v_target；
+    - "no_braking_required"：v_from >= v_target，仅返回锚点；
+    - "brake_insufficient"：制动力无法克服下坡与阻力，点列为已反推部分；
+    - "track_start_reached" / "backward_steps_exceeded"：覆盖里程或步数不足。
+    """
+    if v_from >= v_target:
+        return [(s_from, v_from)], "no_braking_required", s_from
+    points: list[tuple[float, float]] = [(s_from, v_from)]
+    s, v = s_from, v_from
+    min_s = s
+    steps = 0
+    while s > s_min:
+        ns, nv, decel = _backward_step(model, s, v, ds)
+        if decel <= 1e-6:
+            return points, (
+                f"brake_insufficient: 在 s={s:.1f} m 处制动力无法克服下坡与阻力，"
+                "无法继续反向减速"
+            ), min_s
+        if nv >= v_target:
+            frac = (v_target - v) / (nv - v)
+            points.append((s - frac * ds, v_target))
+            return points, "ok", min_s
+        s, v = ns, nv
+        min_s = min(min_s, s)
+        points.append((s, v))
+        steps += 1
+        if steps > 2_000_000:
+            return points, "backward_steps_exceeded", min_s
+    return (points,
             f"track_start_reached: 反推至里程 {s_min:.0f} m 仍未达到接近速度",
             min_s)
 

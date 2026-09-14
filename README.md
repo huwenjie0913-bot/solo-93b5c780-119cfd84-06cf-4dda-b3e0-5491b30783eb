@@ -5,6 +5,11 @@
 
 - **输入校验**：区段断裂（gap）、里程重叠（overlap）、单位冲突（km/h 与 m/s、
   ‰ 与 % 混淆）、非物理参数（负质量、负制动力、超物理黏着/坡度等）；
+- **局部低黏着**：每个工况可提交按里程连续的 `adhesion_segments`
+  （起止里程 + 黏着系数），表达秋季落叶、隧道渗水等仅覆盖部分里程的低黏着区；
+  未提交时沿用标量 `adhesion`，旧请求完全兼容。前向 RK4 与限速点反向积分均按
+  当前位置选取黏着上限；汇总列车进出低黏着区的速度、区内最低减速度、受影响
+  限速点，以及相对标量基线的最晚制动位置前移量；
 - **限速点分析**：每个限速收紧点的最晚制动位置（含制动延迟与建立期折算距离）、
   接近速度、轨迹实际通过速度、可行性标记；
 - **指标**：停车余量（相对目标停车点）、最大减速度及其位置；
@@ -51,14 +56,33 @@ curl -OJ -X POST "localhost:8000/api/simulate/csv?kind=summary" -H 'Content-Type
 m_eff · dv/dt = -( F_brake(v,t) + F_rr(v) + F_grade(s) )
 ```
 
-- `F_brake`：制动力曲线（速度→kN，分段线性）× 工况系数，受黏着上限 `μ·m·g` 约束；
-  `t < 延迟` 时为 0，建立期内线性爬坡；
+- `F_brake`：制动力曲线（速度→kN，分段线性）× 工况系数，受黏着上限 `μ(s)·m·g`
+  约束；`μ(s)` 默认取标量 `adhesion`，提交 `adhesion_segments` 时按当前里程
+  从分段表选取；`t < 延迟` 时为 0，建立期内线性爬坡；
 - `F_rr = a + b·v + c·v²`（Davis 滚动阻力）；
 - `F_grade = m·g·slope(s)`，坡度分段恒定，上坡为正；
 - `m_eff = m · 回转质量系数`。
 
 **最晚制动位置**：从限速点以全制动曲线反向积分至接近速度
 （前区段限速与初速度的较小者），再减去 `v·(延迟 + 建立期/2)` 的走行距离。
+反推同样按当前里程选取黏着上限；提交黏着分段时，每个限速点额外给出
+标量基线模型的最晚制动位置 `latest_brake_m_scalar_baseline` 与前移量
+`latest_brake_advance_m`（正值表示低黏着要求更早下闸）。
+
+### 局部低黏着输入与输出
+
+`scenarios[].adhesion_segments` 为按里程升序、首尾相接（不允许空缺/重叠）的
+连续分段表，区段外沿用标量 `adhesion`；如需在两个低黏着点之间保留正常黏着，
+用一段标量黏着显式补齐。分段超出线路覆盖时整段在外将被拒绝（422），
+跨界部分给出警告。
+
+- 每个轨迹点含 `adhesion` 字段（该点实际黏着系数）；
+- 每个制动模式含 `low_adhesion` 汇总：`active`、`baseline_adhesion` 与 `zones`；
+  低于标量基线的相邻分段合并为一个低黏着区，逐区给出 `entry_speed_kmh` /
+  `exit_speed_kmh`（未走到为 null）、`min_deceleration_mps2` 及其里程、
+  `stopped_inside`、`affected_limit_points_m`（含最晚制动前移量）。
+- CSV 轨迹增加 `adhesion` 列；汇总 CSV 增加黏着分段描述、低黏着区、
+  进出速度、区内最低减速度、受影响限速点与最大前移量等列。
 
 ## 项目结构
 
@@ -75,5 +99,5 @@ tests/test_api.py
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 16 个用例
+.venv/bin/python -m pytest tests/ -q   # 26 个用例
 ```

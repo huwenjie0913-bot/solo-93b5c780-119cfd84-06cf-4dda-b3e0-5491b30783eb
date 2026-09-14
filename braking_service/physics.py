@@ -1,10 +1,10 @@
 """核心动力学：分段数值积分（RK4）、反向制动曲线、超速区间扫描。
 
 运动方程（沿里程积分，时间域 RK4）：
-    m_eff * dv/dt = -(F_brake(v,t) + F_rr(v) + F_grade(s))
+    m_eff * dv/dt = -(F_brake(v,t,s) + F_rr(v) + F_grade(s))
     ds/dt = v
 其中：
-- F_brake 受黏着限制：F <= mu * m * g；
+- F_brake 受黏着限制：F <= mu(s) * m * g，mu(s) 可沿里程分段变化；
 - F_rr 为 Davis 滚动阻力；
 - F_grade = m * g * slope(s)，坡度分段恒定，上坡为正。
 """
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 GRAVITY = 9.81
@@ -38,13 +38,17 @@ def interp(x: float, xs: list[float], ys: list[float]) -> float:
 
 @dataclass
 class ForceModel:
-    """单个工况 + 制动模式下的合力模型。"""
+    """单个工况 + 制动模式下的合力模型。
+
+    黏着系数可沿里程分段（adhesion_starts/values 为 [start, end) 分段表）；
+    adhesion_base 为区段外的标量值，也作为与标量基线对比时的基准。
+    """
 
     mass_kg: float           # 静态质量
     eff_mass_kg: float       # 计入回转惯量的等效质量
     curve_speeds: list[float]  # m/s，单调递增
     curve_forces: list[float]  # N
-    adhesion: float
+    adhesion_base: float     # 标量黏着（区段外/基线）
     force_factor: float
     delay_s: float
     buildup_s: float
@@ -52,8 +56,25 @@ class ForceModel:
     rr_b: float
     rr_c: float
     grade_at: Callable[[float], float]  # s -> slope (ratio)
+    adhesion_starts: list[float] = field(default_factory=list)
+    adhesion_ends: list[float] = field(default_factory=list)
+    adhesion_values: list[float] = field(default_factory=list)
 
-    def brake_force(self, v: float, t: float) -> float:
+    @property
+    def adhesion(self) -> float:
+        """标量黏着（无分段时即为实际值；有分段时为基线值）。"""
+        return self.adhesion_base
+
+    def adhesion_at(self, s: float) -> float:
+        """里程 s 处实际黏着上限系数；无覆盖时回落到标量基线。"""
+        if not self.adhesion_values:
+            return self.adhesion_base
+        i = bisect_right(self.adhesion_starts, s) - 1
+        if i >= 0 and s < self.adhesion_ends[i]:
+            return self.adhesion_values[i]
+        return self.adhesion_base
+
+    def brake_force(self, v: float, t: float, s: float) -> float:
         if t < self.delay_s:
             return 0.0
         if self.buildup_s > 0:
@@ -62,12 +83,12 @@ class ForceModel:
             scale = 1.0
         f = interp(max(v, 0.0), self.curve_speeds, self.curve_forces)
         f *= self.force_factor * scale
-        cap = self.adhesion * self.mass_kg * GRAVITY  # 黏着上限
+        cap = self.adhesion_at(s) * self.mass_kg * GRAVITY  # 黏着上限
         return min(f, cap)
 
     def accel(self, t: float, s: float, v: float) -> float:
         vv = max(v, 0.0)
-        f_b = self.brake_force(vv, t)
+        f_b = self.brake_force(vv, t, s)
         f_r = self.rr_a + self.rr_b * vv + self.rr_c * vv * vv
         f_g = self.mass_kg * GRAVITY * self.grade_at(s)
         return -(f_b + f_r + f_g) / self.eff_mass_kg
@@ -77,7 +98,7 @@ class ForceModel:
 class Trajectory:
     """积分结果：等时间间隔采样点 + 终止信息。"""
 
-    points: list[dict]          # {t_s, s_m, v_mps, a_mps2}
+    points: list[dict]          # {t_s, s_m, v_mps, a_mps2, adhesion}
     stopped: bool
     status: str                 # "ok" | "terminated"
     reason: str                 # 终止原因（stopped 时为 "stopped"）
@@ -93,7 +114,8 @@ def integrate(model: ForceModel, s0: float, v0: float, s_max: float,
     points: list[dict] = []
     t, s, v = 0.0, s0, v0
     a0 = model.accel(t, s, v)
-    points.append({"t_s": t, "s_m": s, "v_mps": v, "a_mps2": a0})
+    points.append({"t_s": t, "s_m": s, "v_mps": v, "a_mps2": a0,
+                   "adhesion": model.adhesion_at(s)})
 
     def finish(stopped: bool, status: str, reason: str) -> Trajectory:
         return Trajectory(points=points, stopped=stopped, status=status, reason=reason)
@@ -124,11 +146,13 @@ def integrate(model: ForceModel, s0: float, v0: float, s_max: float,
             if v <= V_STOP:
                 v = 0.0
                 points.append({"t_s": t, "s_m": s, "v_mps": v,
-                               "a_mps2": model.accel(t, s, 0.0)})
+                               "a_mps2": model.accel(t, s, 0.0),
+                               "adhesion": model.adhesion_at(s)})
                 return finish(True, "ok", "stopped")
 
             a = model.accel(t, s, v)
-            points.append({"t_s": t, "s_m": s, "v_mps": v, "a_mps2": a})
+            points.append({"t_s": t, "s_m": s, "v_mps": v, "a_mps2": a,
+                           "adhesion": model.adhesion_at(s)})
 
             if s >= s_max:
                 return finish(False, "terminated",
@@ -144,16 +168,18 @@ def integrate(model: ForceModel, s0: float, v0: float, s_max: float,
 
 def backward_brake_position(model: ForceModel, s_from: float, v_from: float,
                             v_target: float, s_min: float
-                            ) -> tuple[Optional[float], str]:
+                            ) -> tuple[Optional[float], str, float]:
     """从限速点反向积分全制动曲线，求达到 v_target 的最晚全制动位置。
 
-    返回 (位置或 None, 说明)。None 表示在可用里程内无法把速度降到目标，
-    即制动力不足以抵消下坡等因素。
+    返回 (位置或 None, 说明, 反推到达的最小里程)。None 表示在可用里程内
+    无法把速度降到目标，即制动力不足以抵消下坡等因素。反推按当前位置选取
+    黏着上限，因此会正确穿越沿里程分段的低黏着区。
     """
     if v_from >= v_target:
-        return s_from, "no_braking_required"
+        return s_from, "no_braking_required", s_from
     s, v = s_from, v_from
     prev_s, prev_v = s, v
+    min_s = s
     steps = 0
     while s > s_min:
         decel = -model.accel(1e9, s, v)  # t 取大 => 延迟与建立期已过，全制动
@@ -161,18 +187,21 @@ def backward_brake_position(model: ForceModel, s_from: float, v_from: float,
             return None, (
                 f"brake_insufficient: 在 s={s:.1f} m 处制动力无法克服下坡与阻力，"
                 "无法继续反向减速"
-            )
+            ), min_s
         prev_s, prev_v = s, v
         v += decel / v * BACKWARD_DS
         s -= BACKWARD_DS
+        min_s = min(min_s, s)
         steps += 1
         if v >= v_target:
             # 线性插值求穿越点
             frac = (v_target - prev_v) / (v - prev_v)
-            return prev_s - frac * BACKWARD_DS, "ok"
+            return prev_s - frac * BACKWARD_DS, "ok", min_s
         if steps > 2_000_000:
-            return None, "backward_steps_exceeded"
-    return None, f"track_start_reached: 反推至里程 {s_min:.0f} m 仍未达到接近速度"
+            return None, "backward_steps_exceeded", min_s
+    return (None,
+            f"track_start_reached: 反推至里程 {s_min:.0f} m 仍未达到接近速度",
+            min_s)
 
 
 def scan_violations(points: list[dict],

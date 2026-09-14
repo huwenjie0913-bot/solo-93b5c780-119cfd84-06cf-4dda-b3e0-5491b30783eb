@@ -59,6 +59,17 @@ EXAMPLE_REQUEST: dict[str, Any] = {
         {"name": "wet_rail", "adhesion": 0.08, "brake_force_factor": 0.9},
         {"name": "partial_brake_failure", "brake_force_factor": 0.6,
          "delay_s": 2.5},
+        {
+            "name": "leaf_film_tunnel",
+            "adhesion_segments": [
+                # 制动中驶入 250 m 处的落叶低黏着区，450 m 处驶出后黏着恢复；
+                # 900~1100 m 的隧道渗水点不在本次走行轨迹内，但位于
+                # 1200 m 限速点的反推制动路径上，最晚制动位置因此前移。
+                {"start_m": 250, "end_m": 450, "adhesion": 0.06},
+                {"start_m": 450, "end_m": 900, "adhesion": 0.15},
+                {"start_m": 900, "end_m": 1100, "adhesion": 0.06},
+            ],
+        },
     ],
     "target_stop_m": 1000,
     "max_trajectory_points": 300,
@@ -74,15 +85,21 @@ app = FastAPI(
         "用分段 RK4 积分生成常用/紧急制动的速度—里程轨迹；"
         "校验区段断裂、里程重叠、单位冲突与非物理参数；"
         "输出每个限速点的最晚制动位置、停车余量、最大减速度与超速区间；"
+        "支持每工况提交按里程连续的 adhesion_segments 表达落叶/渗水等"
+        "局部低黏着区（缺省沿用标量 adhesion），汇总列车进出低黏着区的速度、"
+        "区内最低减速度、受影响限速点与最晚制动位置前移量；"
         "支持多工况对比（干轨/湿轨/部分失效），按停车余量排序。"
     ),
 )
 
 OPENAPI_EXAMPLES = {
-    "three_scenarios": {
-        "summary": "三工况（干轨/湿轨/部分制动失效）完整示例",
+    "four_scenarios": {
+        "summary": "四工况（干轨/湿轨/部分失效/局部低黏着）完整示例",
         "description": "5 km 线路，含下坡段与两级限速收紧；目标停车点 1000 m，"
-                       "部分制动失效工况将错过停车目标。",
+                       "部分制动失效工况将错过停车目标。leaf_film_tunnel 工况以 "
+                       "adhesion_segments 表达 250~450 m 落叶低黏着区（制动中驶入、"
+                       "驶出后恢复）与 900~1100 m 隧道渗水点（影响 1200 m 限速点的"
+                       "最晚制动位置）。",
         "value": EXAMPLE_REQUEST,
     }
 }
@@ -126,22 +143,49 @@ def simulate_csv(
     if kind == "summary":
         writer.writerow([
             "rank", "scenario", "is_baseline", "adhesion",
+            "adhesion_segments",
             "brake_force_factor", "delay_s", "mode", "status",
             "stop_position_m", "stop_distance_m", "stopping_margin_m",
-            "max_deceleration_mps2", "stop_distance_delta_m_vs_baseline",
+            "max_deceleration_mps2",
+            "low_adhesion_active", "low_adhesion_zones_m",
+            "low_adhesion_entry_speeds_kmh", "low_adhesion_exit_speeds_kmh",
+            "low_adhesion_min_deceleration_mps2",
+            "low_adhesion_affected_limit_points_m",
+            "max_latest_brake_advance_m",
+            "stop_distance_delta_m_vs_baseline",
             "stop_distance_delta_pct_vs_baseline", "termination_reason",
         ])
         for sc in result["scenarios"]:
+            segs = sc["parameters"].get("adhesion_segments")
+            seg_desc = (";".join(f"[{s['start_m']},{s['end_m']}):{s['adhesion']}"
+                                 for s in segs) if segs else "")
             for mode in MODES:
                 m = sc["modes"][mode]
                 d = sc["vs_baseline"][mode]
+                la = m["low_adhesion"]
+                zones = la["zones"]
+                advances = [a["latest_brake_advance_m"]
+                            for z in zones for a in z["affected_limit_points_m"]
+                            if a["latest_brake_advance_m"] is not None]
                 writer.writerow([
                     sc["rank"], sc["name"], sc["is_baseline"],
-                    sc["parameters"]["adhesion"],
+                    sc["parameters"]["adhesion"], seg_desc,
                     sc["parameters"]["brake_force_factor"],
                     sc["parameters"]["delay_s"], mode, m["status"],
                     m["stop_position_m"], m["stop_distance_m"],
                     sc["stopping_margin_m"], m["max_deceleration_mps2"],
+                    la["active"],
+                    ";".join(f"[{z['start_m']},{z['end_m']}]:{z['min_adhesion']}"
+                             for z in zones),
+                    ";".join("" if z["entry_speed_kmh"] is None
+                             else str(z["entry_speed_kmh"]) for z in zones),
+                    ";".join("" if z["exit_speed_kmh"] is None
+                             else str(z["exit_speed_kmh"]) for z in zones),
+                    ";".join("" if z["min_deceleration_mps2"] is None
+                             else str(z["min_deceleration_mps2"]) for z in zones),
+                    ";".join(str(a["at_m"]) for z in zones
+                             for a in z["affected_limit_points_m"]),
+                    max(advances) if advances else "",
                     d["stop_distance_delta_m"], d["stop_distance_delta_pct"],
                     (m["termination"] or {}).get("reason", ""),
                 ])
@@ -149,14 +193,15 @@ def simulate_csv(
     else:
         writer.writerow([
             "scenario", "mode", "t_s", "s_m", "v_mps", "v_kmh",
-            "a_mps2", "grade_permille", "limit_kmh",
+            "a_mps2", "adhesion", "grade_permille", "limit_kmh",
         ])
         for sc in result["scenarios"]:
             for mode in MODES:
                 for p in sc["modes"][mode]["trajectory"]:
                     writer.writerow([
                         sc["name"], mode, p["t_s"], p["s_m"], p["v_mps"],
-                        p["v_kmh"], p["a_mps2"], p["grade_permille"],
+                        p["v_kmh"], p["a_mps2"], p["adhesion"],
+                        p["grade_permille"],
                         p["limit_kmh"] if p["limit_kmh"] is not None else "",
                     ])
         filename = "braking_trajectories.csv"

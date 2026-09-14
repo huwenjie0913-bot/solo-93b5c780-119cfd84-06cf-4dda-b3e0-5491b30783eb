@@ -44,6 +44,42 @@ def _check_segments(segs, kind: str, errors: list[dict]) -> None:
                 f"{cur.start_m - prev.end_m:.3f} m 空缺", loc))
 
 
+def _check_adhesion_segments(req: SimulationRequest, si: int, segs,
+                             errors: list[dict], warnings: list[dict],
+                             g_start: float, g_end: float) -> None:
+    """校验单个工况的黏着区段：排序/空缺/重叠、覆盖范围与非物理取值。"""
+    kind = f"scenarios[{si}].adhesion_segments"
+    # 排序、重叠、断裂（与坡度/限速同一套规则与错误码）
+    _check_segments(segs, kind, errors)
+
+    for j, seg in enumerate(segs):
+        loc = f"{kind}[{j}]"
+        # 非物理取值（Pydantic 已限制 (0,1]，这里拦截极端低值等异常输入）
+        if seg.adhesion <= 0 or seg.adhesion > 1.0:
+            errors.append(_issue(
+                "non_physical",
+                f"黏着系数 {seg.adhesion} 越出物理区间 (0, 1]",
+                f"{loc}.adhesion"))
+        elif seg.adhesion > MAX_ADHESION_STEEL:
+            warnings.append(_issue(
+                "non_physical_suspect",
+                f"工况黏着区段 [{seg.start_m}, {seg.end_m}) m 黏着系数 "
+                f"{seg.adhesion} 高于钢轮钢轨经验上限 {MAX_ADHESION_STEEL}",
+                f"{loc}.adhesion"))
+
+        # 覆盖范围：整段在线路覆盖外为错误，跨界为警告（界外按标量黏着外延）
+        if seg.end_m <= g_start - EPS_M or seg.start_m >= g_end + EPS_M:
+            errors.append(_issue(
+                "adhesion_segment_out_of_coverage",
+                f"黏着区段 [{seg.start_m}, {seg.end_m}) m 完全位于线路覆盖 "
+                f"[{g_start}, {g_end}] m 之外，对仿真无作用", loc))
+        elif seg.start_m < g_start - EPS_M or seg.end_m > g_end + EPS_M:
+            warnings.append(_issue(
+                "adhesion_segment_partial_coverage",
+                f"黏着区段 [{seg.start_m}, {seg.end_m}) m 超出线路覆盖 "
+                f"[{g_start}, {g_end}] m，界外部分按标量黏着处理", loc))
+
+
 def validate_request(req: SimulationRequest) -> tuple[list[dict], list[dict]]:
     errors: list[dict] = []
     warnings: list[dict] = []
@@ -133,6 +169,10 @@ def validate_request(req: SimulationRequest) -> tuple[list[dict], list[dict]]:
                 "non_physical_suspect",
                 f"工况 '{sc.name}' 黏着系数 {mu} 高于经验上限 "
                 f"{MAX_ADHESION_STEEL}", f"scenarios[{i}].adhesion"))
+        if sc.adhesion_segments:
+            _check_adhesion_segments(
+                req, i, sc.adhesion_segments, errors, warnings,
+                g_start, g_end)
 
     # --- 制动力曲线 ---
     for name, curve in (("service_brake", req.service_brake),

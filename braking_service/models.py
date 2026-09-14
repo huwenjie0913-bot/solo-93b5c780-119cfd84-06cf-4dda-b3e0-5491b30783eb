@@ -82,12 +82,39 @@ class Vehicle(BaseModel):
     )
 
 
+class AdhesionSegment(BaseModel):
+    """黏着区段：[start_m, end_m) 内黏着系数恒定为 adhesion。
+
+    用于表达落叶、隧道渗水等仅覆盖部分里程的低黏着区；区段外沿用标量
+    adhesion（请求级或工况级覆盖值）。
+    """
+
+    start_m: float = Field(..., description="区段起点里程 (m)")
+    end_m: float = Field(..., description="区段终点里程 (m)")
+    adhesion: float = Field(
+        ..., gt=0, le=1.0, description="该区段黏着系数（0, 1]，非物理取值将被拒绝")
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "AdhesionSegment":
+        if self.end_m <= self.start_m:
+            raise ValueError("end_m 必须大于 start_m")
+        return self
+
+
 class Scenario(BaseModel):
     """工况：覆盖基准参数以模拟干轨/湿轨/部分制动失效等。"""
 
     name: str = Field(..., min_length=1, max_length=64)
     adhesion: Optional[float] = Field(
         None, gt=0, le=1.0, description="黏着系数覆盖值；缺省用请求级 adhesion"
+    )
+    adhesion_segments: Optional[list[AdhesionSegment]] = Field(
+        None,
+        description=(
+            "按里程连续排列的黏着区段（落叶/隧道渗水等局部低黏着）；"
+            "区段内以此处黏着系数为黏着上限，区段外用 adhesion 标量；"
+            "缺省或为空表示全程使用标量 adhesion，与旧请求兼容"
+        ),
     )
     brake_force_factor: float = Field(
         1.0, gt=0, le=1.0, description="制动力比例系数，1=全力，<1 表示部分失效"
